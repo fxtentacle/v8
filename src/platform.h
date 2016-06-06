@@ -73,8 +73,10 @@ int strncasecmp(const char* s1, const char* s2, int n);
 
 #endif  // _MSC_VER
 
+#ifndef __CYGWIN__
 // Random is missing on both Visual Studio and MinGW.
 int random();
+#endif
 
 #endif  // WIN32
 
