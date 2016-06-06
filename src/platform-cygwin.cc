@@ -318,10 +318,97 @@ bool VirtualMemory::IsReserved() {
 }
 
 
+void VirtualMemory::Reset() {
+  address_ = NULL;
+  size_ = 0;
+}
+
+VirtualMemory::VirtualMemory() : address_(NULL), size_(0) { }
+
+
 VirtualMemory::VirtualMemory(size_t size) {
   address_ = VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_NOACCESS);
   size_ = size;
 }
+
+
+static void* GetRandomAddr() {
+  Isolate* isolate = Isolate::UncheckedCurrent();
+  // Note that the current isolate isn't set up in a call path via
+  // CpuFeatures::Probe. We don't care about randomization in this case because
+  // the code page is immediately freed.
+  if (isolate != NULL) {
+    // The address range used to randomize RWX allocations in OS::Allocate
+    // Try not to map pages into the default range that windows loads DLLs
+    // Use a multiple of 64k to prevent committing unused memory.
+    // Note: This does not guarantee RWX regions will be within the
+    // range kAllocationRandomAddressMin to kAllocationRandomAddressMax
+#ifdef V8_HOST_ARCH_64_BIT
+    static const intptr_t kAllocationRandomAddressMin = 0x0000000080000000;
+    static const intptr_t kAllocationRandomAddressMax = 0x000003FFFFFF0000;
+#else
+    static const intptr_t kAllocationRandomAddressMin = 0x04000000;
+    static const intptr_t kAllocationRandomAddressMax = 0x3FFF0000;
+#endif
+    uintptr_t address = (V8::RandomPrivate(isolate) << kPageSizeBits)
+        | kAllocationRandomAddressMin;
+    address &= kAllocationRandomAddressMax;
+    return reinterpret_cast<void *>(address);
+  }
+  return NULL;
+}
+
+
+static void* RandomizedVirtualAlloc(size_t size, int action, int protection) {
+  LPVOID base = NULL;
+
+  if (protection == PAGE_EXECUTE_READWRITE || protection == PAGE_NOACCESS) {
+    // For exectutable pages try and randomize the allocation address
+    for (size_t attempts = 0; base == NULL && attempts < 3; ++attempts) {
+      base = VirtualAlloc(GetRandomAddr(), size, action, protection);
+    }
+  }
+
+  // After three attempts give up and let the OS find an address to use.
+  if (base == NULL) base = VirtualAlloc(NULL, size, action, protection);
+
+  return base;
+}
+
+
+
+void* VirtualMemory::ReserveRegion(size_t size) {
+  return RandomizedVirtualAlloc(size, MEM_RESERVE, PAGE_NOACCESS);
+}
+
+
+VirtualMemory::VirtualMemory(size_t size, size_t alignment)
+    : address_(NULL), size_(0) {
+  ASSERT(IsAligned(alignment, static_cast<intptr_t>(OS::AllocateAlignment())));
+  size_t request_size = RoundUp(size + alignment,
+                                static_cast<intptr_t>(OS::AllocateAlignment()));
+  void* address = ReserveRegion(request_size);
+  if (address == NULL) return;
+  Address base = RoundUp(static_cast<Address>(address), alignment);
+  // Try reducing the size by freeing and then reallocating a specific area.
+  bool result = ReleaseRegion(address, request_size);
+  USE(result);
+  ASSERT(result);
+  address = VirtualAlloc(base, size, MEM_RESERVE, PAGE_NOACCESS);
+  if (address != NULL) {
+    request_size = size;
+    ASSERT(base == static_cast<Address>(address));
+  } else {
+    // Resizing failed, just go with a bigger area.
+    address = ReserveRegion(request_size);
+    if (address == NULL) return;
+  }
+  address_ = address;
+  size_ = request_size;
+}
+
+
+
 
 
 VirtualMemory::~VirtualMemory() {
@@ -331,7 +418,7 @@ VirtualMemory::~VirtualMemory() {
 }
 
 
-bool VirtualMemory::Commit(void* address, size_t size, bool is_executable) {
+bool VirtualMemory::CommitRegion(void* address, size_t size, bool is_executable) {
   int prot = is_executable ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
   if (NULL == VirtualAlloc(address, size, MEM_COMMIT, prot)) {
     return false;
@@ -342,9 +429,27 @@ bool VirtualMemory::Commit(void* address, size_t size, bool is_executable) {
 }
 
 
+bool VirtualMemory::Commit(void* address, size_t size, bool is_executable) {
+  if (CommitRegion(address, size, is_executable)) {
+    UpdateAllocatedSpaceLimits(address, static_cast<int>(size));
+    return true;
+  }
+  return false;
+}
+
+
 bool VirtualMemory::Uncommit(void* address, size_t size) {
   ASSERT(IsReserved());
   return VirtualFree(address, size, MEM_DECOMMIT) != false;
+}
+
+bool VirtualMemory::UncommitRegion(void* base, size_t size) {
+  return VirtualFree(base, size, MEM_DECOMMIT) != 0;
+}
+
+
+bool VirtualMemory::ReleaseRegion(void* base, size_t size) {
+  return VirtualFree(base, 0, MEM_RELEASE) != 0;
 }
 
 
